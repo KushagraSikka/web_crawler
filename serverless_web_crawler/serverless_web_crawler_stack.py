@@ -1,77 +1,54 @@
-from aws_cdk import (
-    Stack,
-    aws_lambda as _lambda,
-    aws_lambda_python_alpha as _alambda,
-    aws_dynamodb as _dynamodb,
-    aws_sqs as _sqs,
-    aws_lambda_event_sources as _event_source
-)
+from aws_cdk import Stack
+from aws_lambda import Runtime as LambdaRuntime
+from aws_lambda_python_alpha import PythonFunction
+from aws_dynamodb import Table, Attribute, AttributeType, BillingMode
+from aws_sqs import Queue
+from aws_lambda_event_sources import SqsEventSource
 from constructs import Construct
 
 class ServerlessWebCrawlerStack(Stack):
-
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, **kwargs):
         super().__init__(scope, construct_id, **kwargs)
 
-        # Dynamo Model
-        # PK: VisitedURL
-        # SK: RunId#Date
-        # SourceURL (Where Did I come from?)
-        # RootURL (Where Did I start?)
-
-        #Dynamo - VisitedUrls Table
-        table = _dynamodb.Table(self, "VisitedURLs",
+        # Initialize DynamoDB table for visited URLs
+        table = Table(
+            self, "VisitedURLs",
             table_name="VisitedURLs",
-            partition_key=_dynamodb.Attribute(name="visitedURL", type=_dynamodb.AttributeType.STRING),
-            sort_key=_dynamodb.Attribute(name="runId", type=_dynamodb.AttributeType.STRING),
-            billing_mode=_dynamodb.BillingMode.PAY_PER_REQUEST
+            partition_key=Attribute(name="visitedURL", type=AttributeType.STRING),
+            sort_key=Attribute(name="runId", type=AttributeType.STRING),
+            billing_mode=BillingMode.PAY_PER_REQUEST
         )
 
-        #SQS - PendingCrawls
-        crawlerQueue = _sqs.Queue(self, "Crawler", queue_name="Crawler")
-        crawlerDLQ = _sqs.Queue(self, "Crawler-DLQ", queue_name="Crawler-DLQ")
+        # Initialize SQS queues for crawling tasks and dead-letter handling
+        crawler_queue = Queue(self, "CrawlerQueue", queue_name="CrawlerQueue")
+        dead_letter_queue = Queue(self, "CrawlerDLQ", queue_name="CrawlerDLQ")
 
-        #Initiator
-        initiatorFunction = _alambda.PythonFunction(
-            self,
-            "InitiatorFn",
+        # Define lambda functions for initiating and handling crawling
+        initiator_function = PythonFunction(
+            self, "InitiatorFn",
             entry="./lambda/",
-            runtime=_lambda.Runtime.PYTHON_3_9,
+            runtime=LambdaRuntime.PYTHON_3_9,
             index="initiator.py",
             handler="handle"
-            #environment={"VisitedURLsTableARN": table.table_arn}
         )
 
-        #Crawler
-        crawlerFunction = _alambda.PythonFunction(
-            self,
-            "CrawlerFn",
+        crawler_function = PythonFunction(
+            self, "CrawlerFn",
             entry="./lambda/",
-            runtime=_lambda.Runtime.PYTHON_3_9,
+            runtime=LambdaRuntime.PYTHON_3_9,
             index="crawler.py",
             handler="handle",
             reserved_concurrent_executions=2,
             dead_letter_queue_enabled=True,
-            dead_letter_queue=crawlerDLQ
-            #environment={"VisitedURLsTableARN": table.table_arn}
+            dead_letter_queue=dead_letter_queue
         )
-        
 
-        #Queue read write permissions
-        crawlerQueue.grant_send_messages(initiatorFunction)
-        crawlerQueue.grant_send_messages(crawlerFunction)
-        crawlerQueue.grant_consume_messages(crawlerFunction)
+        # Setup permissions for SQS and DynamoDB interactions
+        crawler_queue.grant_send_messages(initiator_function)
+        crawler_queue.grant_send_messages(crawler_function)
+        crawler_queue.grant_consume_messages(crawler_function)
+        table.grant_read_write_data(initiator_function)
+        table.grant_read_write_data(crawler_function)
 
-        #DynamoDB read write permissions
-        table.grant_read_write_data(initiatorFunction)
-        table.grant_read_write_data(crawlerFunction)
-
-        #Subscribe Crawler to SQS
-        event_source = _event_source.SqsEventSource(crawlerQueue, batch_size=1)
-        
-        crawlerFunction.add_event_source(event_source)
-
-
-
-        
-
+        # Attach the SQS queue as an event source for the crawler lambda function
+        crawler_function.add_event_source(SqsEventSource(crawler_queue, batch_size=1))
